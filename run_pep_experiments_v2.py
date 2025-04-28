@@ -37,8 +37,8 @@ log = logging.getLogger(__name__)
 # 3.  Global parameters
 # ------------------------------------------------------------------
 L, gamma, beta, D = 1.0, 1.0, 1.0, 1.0
-ALPHAS = (0.01, 0.1, 0.5, 1.0)
-N_STEPS = np.arange(1, 101)
+ALPHAS = (0.1, 0.5, 1.0)
+N_STEPS = np.arange(1, 61)
 OUTFILE = "pep_results.pkl"
 
 MAX_WORKERS = min(32, os.cpu_count())
