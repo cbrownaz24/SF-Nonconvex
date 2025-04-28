@@ -1,105 +1,126 @@
 #!/usr/bin/env python3
 """
-Run all PEPit experiments and dump the results to pep_results.pkl
-_______________________________________________________________
-Usage (inside tmux or the shell):   python run_pep_experiments.py
+Robust parallel PEPit sweep
+––––––––––––––––––––––––––––
+• Capped BLAS threads  • spawn context
+• Guarded workers      • Live progress logging
 """
 
-import itertools, pickle, os, numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+# ------------------------------------------------------------------
+# 0.  Environment guards
+# ------------------------------------------------------------------
+import os, multiprocessing as mp
+os.environ["OMP_NUM_THREADS"]       = "1"
+os.environ["MKL_NUM_THREADS"]       = "1"
+os.environ["OPENBLAS_NUM_THREADS"]  = "1"
 
+# ------------------------------------------------------------------
+# 1.  Imports
+# ------------------------------------------------------------------
+import itertools, pickle, sys, logging, datetime
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from PEPit import PEP
 from PEPit.functions import SmoothFunction
 
 
 # ------------------------------------------------------------------
-# --- parameters you might want to tweak ---------------------------
-L       = 1.0          # smoothness
-gamma   = 1.0          # L·η ≤ 1
-beta    = 1.0          # interpolation parameter
-D       = 1.0          # initial distance bound
-ALPHAS  = (0.01, 0.1, 0.5, 1.0)
+# 2.  Logging setup
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%Y-%m-%d %H:%M:%S] pid%(process)d %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# 3.  Parameters
+# ------------------------------------------------------------------
+L, gamma, beta, D = 1.0, 1.0, 1.0, 1.0
+ALPHAS = (0.01, 0.1, 0.5, 1.0)
 N_STEPS = np.arange(1, 101)
 OUTFILE = "pep_results.pkl"
+
+MAX_WORKERS = min(32, os.cpu_count())
+CTX = mp.get_context("spawn")
+
+
 # ------------------------------------------------------------------
+# 4.  Guard decorator
+# ------------------------------------------------------------------
+def _guard(fn):
+    def wrapped(arg):
+        try:
+            return fn(arg)
+        except Exception:  # print traceback inside worker
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush(); sys.stderr.flush()
+            raise
+    return wrapped
 
 
-def decreasing_c_worker(alpha_n):
-    """One run for c_{t+1} = (1/(t+1))^α."""
+# ------------------------------------------------------------------
+# 5.  Worker definitions  (identical maths, just logging flush)
+# ------------------------------------------------------------------
+@_guard
+def dec_worker(alpha_n):
     alpha, n = alpha_n
-    problem  = PEP()
-    f        = problem.declare_function(SmoothFunction, L=L)
-    x0       = problem.set_initial_point()
-    x = z    = x0
-    _, f0    = f.oracle(x0)
-
+    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
+    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
     for k in range(n):
-        y, _  = (1 - beta) * z + beta * x, None
-        gy, _ = f.oracle(y)
-        z     = z - gamma * gy
-        c_k   = 1 / (k + 1) ** alpha
-        x     = (1 - c_k) * x + c_k * z
+        y = (1 - beta) * z + beta * x
+        gy, _ = f.oracle(y); z -= gamma * gy
+        c_k = 1 / (k + 1) ** alpha
+        x = (1 - c_k) * x + c_k * z
         gx, _ = f.oracle(x)
         problem.set_performance_metric(gx ** 2)
-
     problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
     tau = problem.solve(wrapper="cvxpy", verbose=0)
     return ("dec", alpha, n, tau)
 
 
-def increasing_c_worker(alpha_n):
-    """One run for c_{t+1} = (t/(t+1))^α."""
+@_guard
+def inc_worker(alpha_n):
     alpha, n = alpha_n
-    problem  = PEP()
-    f        = problem.declare_function(SmoothFunction, L=L)
-    x0       = problem.set_initial_point()
-    x = z    = x0
-    _, f0    = f.oracle(x0)
-
+    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
+    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
     for k in range(n):
-        y, _  = (1 - beta) * z + beta * x, None
-        gy, _ = f.oracle(y)
-        z     = z - gamma * gy
-        c_k   = (k / (k + 1)) ** alpha
-        x     = (1 - c_k) * x + c_k * z
+        y = (1 - beta) * z + beta * x
+        gy, _ = f.oracle(y); z -= gamma * gy
+        c_k = (k / (k + 1)) ** alpha
+        x = (1 - c_k) * x + c_k * z
         gx, _ = f.oracle(x)
         problem.set_performance_metric(gx ** 2)
-
     problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
     tau = problem.solve(wrapper="cvxpy", verbose=0)
     return ("inc", alpha, n, tau)
 
 
-def distance_worker(n):
-    """Worst-case ‖zₙ − xₙ‖² when η_t = (t+1)/L."""
-    problem  = PEP()
-    f        = problem.declare_function(SmoothFunction, L=L)
-    x0       = problem.set_initial_point()
-    x = z    = x0
-    _, f0    = f.oracle(x0)
-
+@_guard
+def dist_worker(n):
+    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
+    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
     for k in range(n):
-        y, _  = (1 - beta) * z + beta * x, None
-        gy, _ = f.oracle(y)
-        z     = z - gamma * (k + 1) * gy          # linear step
-        x     = (1 - 1 / (k + 1)) * x + (1 / (k + 1)) * z
+        y = (1 - beta) * z + beta * x
+        gy, _ = f.oracle(y); z -= gamma * (k + 1) * gy
+        x = (1 - 1 / (k + 1)) * x + (1 / (k + 1)) * z
         gx, _ = f.oracle(x)
         problem.set_performance_metric((x - z) ** 2)
-
     problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
     tau = problem.solve(wrapper="cvxpy", verbose=0)
     return ("dist", None, n, tau)
 
 
+# ------------------------------------------------------------------
+# 6.  Driver
+# ------------------------------------------------------------------
 def main():
-    # skip everything if results already exist
     if os.path.exists(OUTFILE):
-        print(f"{OUTFILE} already present – nothing to do.")
+        log.error("%s already exists – aborting.", OUTFILE)
         return
-
-    tasks_dec = list(itertools.product(ALPHAS, N_STEPS))
-    tasks_inc = list(itertools.product(ALPHAS, N_STEPS))
-    tasks_dist = N_STEPS
 
     results = {
         "decreasing": {a: np.empty_like(N_STEPS, dtype=float) for a in ALPHAS},
@@ -107,16 +128,26 @@ def main():
         "distance":   np.empty_like(N_STEPS, dtype=float),
     }
 
-    with ProcessPoolExecutor() as pool:
+    tasks_dec  = list(itertools.product(ALPHAS, N_STEPS))
+    tasks_inc  = list(itertools.product(ALPHAS, N_STEPS))
+    tasks_dist = list(N_STEPS)
+    TOTAL      = len(tasks_dec) + len(tasks_inc) + len(tasks_dist)
+    done       = 0
+
+    log.info("Launching %d worker processes (max %d).", TOTAL, MAX_WORKERS)
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS,
+                             mp_context=CTX) as pool:
+
         futures = (
-            [pool.submit(decreasing_c_worker, t) for t in tasks_dec] +
-            [pool.submit(increasing_c_worker, t) for t in tasks_inc] +
-            [pool.submit(distance_worker,       n) for n in tasks_dist]
+            [pool.submit(dec_worker,  t) for t in tasks_dec]  +
+            [pool.submit(inc_worker,  t) for t in tasks_inc]  +
+            [pool.submit(dist_worker, n) for n in tasks_dist]
         )
 
         for fut in as_completed(futures):
             kind, alpha, n, tau = fut.result()
-            idx = n - 1  # zero-based
+            idx = n - 1
             if kind == "dec":
                 results["decreasing"][alpha][idx] = tau
             elif kind == "inc":
@@ -124,9 +155,12 @@ def main():
             else:
                 results["distance"][idx] = tau
 
+            done += 1
+            log.info("➀%4d/%d finished (%s α=%s, n=%d)", done, TOTAL, kind, alpha, n)
+
     with open(OUTFILE, "wb") as fh:
         pickle.dump({"n_steps": N_STEPS, **results}, fh)
-    print(f"Saved results to {OUTFILE}")
+    log.info("All %d tasks done – results dumped to %s", TOTAL, OUTFILE)
 
 
 if __name__ == "__main__":
