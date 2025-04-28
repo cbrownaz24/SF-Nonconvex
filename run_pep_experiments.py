@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Robust parallel PEPit sweep
-––––––––––––––––––––––––––––
-• Capped BLAS threads  • spawn context
-• Guarded workers      • Live progress logging
+Robust parallel PEPit sweep  –  pickle-safe edition
+–––––––––––––––––––––––––––––––––––––––––––––––––––
+• Caps BLAS threads        • spawn context
+• Progress logging          • Inline exception reporting
 """
 
 # ------------------------------------------------------------------
-# 0.  Environment guards
+# 0.  Environment guards (must precede NumPy / CVXPY)
 # ------------------------------------------------------------------
 import os, multiprocessing as mp
 os.environ["OMP_NUM_THREADS"]       = "1"
@@ -17,26 +17,24 @@ os.environ["OPENBLAS_NUM_THREADS"]  = "1"
 # ------------------------------------------------------------------
 # 1.  Imports
 # ------------------------------------------------------------------
-import itertools, pickle, sys, logging, datetime
+import itertools, pickle, sys, logging
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from PEPit import PEP
 from PEPit.functions import SmoothFunction
 
-
 # ------------------------------------------------------------------
-# 2.  Logging setup
+# 2.  Logging
 # ------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="[%Y-%m-%d %H:%M:%S] pid%(process)d %(message)s",
+    format="[%(asctime)s] pid%(process)d %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-
 # ------------------------------------------------------------------
-# 3.  Parameters
+# 3.  Global parameters
 # ------------------------------------------------------------------
 L, gamma, beta, D = 1.0, 1.0, 1.0, 1.0
 ALPHAS = (0.01, 0.1, 0.5, 1.0)
@@ -46,76 +44,95 @@ OUTFILE = "pep_results.pkl"
 MAX_WORKERS = min(32, os.cpu_count())
 CTX = mp.get_context("spawn")
 
-
 # ------------------------------------------------------------------
-# 4.  Guard decorator
+# 4.  Worker functions (top-level ⇒ picklable)
 # ------------------------------------------------------------------
-def _guard(fn):
-    def wrapped(arg):
-        try:
-            return fn(arg)
-        except Exception:  # print traceback inside worker
-            import traceback
-            traceback.print_exc()
-            sys.stdout.flush(); sys.stderr.flush()
-            raise
-    return wrapped
-
-
-# ------------------------------------------------------------------
-# 5.  Worker definitions  (identical maths, just logging flush)
-# ------------------------------------------------------------------
-@_guard
 def dec_worker(alpha_n):
-    alpha, n = alpha_n
-    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
-    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
-    for k in range(n):
-        y = (1 - beta) * z + beta * x
-        gy, _ = f.oracle(y); z -= gamma * gy
-        c_k = 1 / (k + 1) ** alpha
-        x = (1 - c_k) * x + c_k * z
-        gx, _ = f.oracle(x)
-        problem.set_performance_metric(gx ** 2)
-    problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
-    tau = problem.solve(wrapper="cvxpy", verbose=0)
-    return ("dec", alpha, n, tau)
+    try:
+        alpha, n = alpha_n
+        problem = PEP()
+        f = problem.declare_function(SmoothFunction, L=L)
+        x0 = problem.set_initial_point()
+        x = z = x0
+        _, f0 = f.oracle(x0)
+
+        for k in range(n):
+            y = (1 - beta) * z + beta * x
+            gy, _ = f.oracle(y)
+            z -= gamma * gy
+            c_k = 1 / (k + 1) ** alpha
+            x = (1 - c_k) * x + c_k * z
+            gx, _ = f.oracle(x)
+            problem.set_performance_metric(gx ** 2)
+
+        problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
+        tau = problem.solve(wrapper="cvxpy", verbose=0)
+        return ("dec", alpha, n, tau)
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        raise
 
 
-@_guard
 def inc_worker(alpha_n):
-    alpha, n = alpha_n
-    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
-    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
-    for k in range(n):
-        y = (1 - beta) * z + beta * x
-        gy, _ = f.oracle(y); z -= gamma * gy
-        c_k = (k / (k + 1)) ** alpha
-        x = (1 - c_k) * x + c_k * z
-        gx, _ = f.oracle(x)
-        problem.set_performance_metric(gx ** 2)
-    problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
-    tau = problem.solve(wrapper="cvxpy", verbose=0)
-    return ("inc", alpha, n, tau)
+    try:
+        alpha, n = alpha_n
+        problem = PEP()
+        f = problem.declare_function(SmoothFunction, L=L)
+        x0 = problem.set_initial_point()
+        x = z = x0
+        _, f0 = f.oracle(x0)
+
+        for k in range(n):
+            y = (1 - beta) * z + beta * x
+            gy, _ = f.oracle(y)
+            z -= gamma * gy
+            c_k = (k / (k + 1)) ** alpha
+            x = (1 - c_k) * x + c_k * z
+            gx, _ = f.oracle(x)
+            problem.set_performance_metric(gx ** 2)
+
+        problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
+        tau = problem.solve(wrapper="cvxpy", verbose=0)
+        return ("inc", alpha, n, tau)
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        raise
 
 
-@_guard
 def dist_worker(n):
-    problem = PEP(); f = problem.declare_function(SmoothFunction, L=L)
-    x0 = problem.set_initial_point(); x = z = x0; _, f0 = f.oracle(x0)
-    for k in range(n):
-        y = (1 - beta) * z + beta * x
-        gy, _ = f.oracle(y); z -= gamma * (k + 1) * gy
-        x = (1 - 1 / (k + 1)) * x + (1 / (k + 1)) * z
-        gx, _ = f.oracle(x)
-        problem.set_performance_metric((x - z) ** 2)
-    problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
-    tau = problem.solve(wrapper="cvxpy", verbose=0)
-    return ("dist", None, n, tau)
+    try:
+        problem = PEP()
+        f = problem.declare_function(SmoothFunction, L=L)
+        x0 = problem.set_initial_point()
+        x = z = x0
+        _, f0 = f.oracle(x0)
 
+        for k in range(n):
+            y = (1 - beta) * z + beta * x
+            gy, _ = f.oracle(y)
+            z -= gamma * (k + 1) * gy
+            x = (1 - 1 / (k + 1)) * x + (1 / (k + 1)) * z
+            gx, _ = f.oracle(x)
+            problem.set_performance_metric((x - z) ** 2)
+
+        problem.set_initial_condition((f0 - f.oracle(x)[1]) <= D)
+        tau = problem.solve(wrapper="cvxpy", verbose=0)
+        return ("dist", None, n, tau)
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        raise
 
 # ------------------------------------------------------------------
-# 6.  Driver
+# 5.  Driver
 # ------------------------------------------------------------------
 def main():
     if os.path.exists(OUTFILE):
@@ -134,7 +151,7 @@ def main():
     TOTAL      = len(tasks_dec) + len(tasks_inc) + len(tasks_dist)
     done       = 0
 
-    log.info("Launching %d worker processes (max %d).", TOTAL, MAX_WORKERS)
+    log.info("Launching %d tasks with %d worker processes…", TOTAL, MAX_WORKERS)
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS,
                              mp_context=CTX) as pool:
@@ -160,8 +177,8 @@ def main():
 
     with open(OUTFILE, "wb") as fh:
         pickle.dump({"n_steps": N_STEPS, **results}, fh)
-    log.info("All %d tasks done – results dumped to %s", TOTAL, OUTFILE)
+    log.info("All %d tasks done – results saved to %s", TOTAL, OUTFILE)
 
-
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     main()
